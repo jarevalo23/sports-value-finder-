@@ -2,6 +2,10 @@ import { NextRequest, NextResponse } from 'next/server';
 import { fetchOdds, fetchSports, getDemoOdds } from '@/services/oddsApi';
 import { Game } from '@/types/odds';
 
+// Force dynamic rendering - no caching
+export const dynamic = 'force-dynamic';
+export const revalidate = 0;
+
 const API_KEY = process.env.ODDS_API_KEY || 'demo';
 const USE_DEMO_FALLBACK = true; // Always fall back to demo data if API fails
 
