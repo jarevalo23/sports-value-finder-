@@ -43,8 +43,31 @@ export async function GET(request: NextRequest) {
       });
     }
 
-    // Use demo data for reliable portfolio display
-    const allGames: Game[] = getDemoOdds('basketball_nba').concat(getDemoOdds('americanfootball_nfl'));
+    // Try live API first, fall back to demo data
+    let allGames: Game[] = [];
+
+    for (const sport of sports) {
+      try {
+        const games = await fetchOdds(sport, {
+          apiKey: API_KEY,
+          markets: markets as ('h2h' | 'spreads' | 'totals')[],
+          regions: 'us',
+          oddsFormat: 'american',
+        });
+        if (games && games.length > 0) {
+          allGames.push(...games);
+        }
+      } catch {
+        // API failed - will use demo fallback
+      }
+    }
+
+    // Fallback to demo data if live API returned nothing
+    if (allGames.length === 0) {
+      for (const sport of sports) {
+        allGames.push(...getDemoOdds(sport));
+      }
+    }
 
     // Update cache
     cache.data = allGames;
