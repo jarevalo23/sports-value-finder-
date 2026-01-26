@@ -43,15 +43,8 @@ export async function GET(request: NextRequest) {
       });
     }
 
-    // Fetch fresh data - always use demo data for reliable portfolio display
-    let allGames: Game[] = [];
-
-    // Use demo data directly for reliable portfolio display
-    // (Live API quota may be exhausted)
-    for (const sport of sports) {
-      const demoGames = getDemoOdds(sport);
-      allGames.push(...demoGames);
-    }
+    // Use demo data for reliable portfolio display
+    const allGames: Game[] = getDemoOdds('basketball_nba').concat(getDemoOdds('americanfootball_nfl'));
 
     // Update cache
     cache.data = allGames;
