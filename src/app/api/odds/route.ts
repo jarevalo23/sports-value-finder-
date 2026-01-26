@@ -46,30 +46,11 @@ export async function GET(request: NextRequest) {
     // Fetch fresh data - always use demo data for reliable portfolio display
     let allGames: Game[] = [];
 
-    // Try live API first
+    // Use demo data directly for reliable portfolio display
+    // (Live API quota may be exhausted)
     for (const sport of sports) {
-      try {
-        const games = await fetchOdds(sport, {
-          apiKey: API_KEY,
-          markets: markets as ('h2h' | 'spreads' | 'totals')[],
-          regions: 'us',
-          oddsFormat: 'american',
-        });
-        if (games && games.length > 0) {
-          allGames.push(...games);
-        }
-      } catch (err) {
-        console.error(`Failed to fetch odds for ${sport}:`, err);
-      }
-    }
-
-    // Always fall back to demo data if no live data available
-    if (allGames.length === 0) {
-      console.log('No live data, using demo data');
-      for (const sport of sports) {
-        const demoGames = getDemoOdds(sport);
-        allGames.push(...demoGames);
-      }
+      const demoGames = getDemoOdds(sport);
+      allGames.push(...demoGames);
     }
 
     // Update cache
