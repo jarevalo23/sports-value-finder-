@@ -1,8 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { fetchOdds, fetchSports } from '@/services/oddsApi';
+import { fetchOdds, fetchSports, getDemoOdds } from '@/services/oddsApi';
 import { Game } from '@/types/odds';
 
 const API_KEY = process.env.ODDS_API_KEY || 'demo';
+const USE_DEMO_FALLBACK = true; // Always fall back to demo data if API fails
 
 // In-memory cache for rate limiting
 const cache: {
@@ -39,7 +40,7 @@ export async function GET(request: NextRequest) {
     }
 
     // Fetch fresh data
-    const allGames: Game[] = [];
+    let allGames: Game[] = [];
 
     for (const sport of sports) {
       try {
@@ -52,7 +53,19 @@ export async function GET(request: NextRequest) {
         allGames.push(...games);
       } catch (err) {
         console.error(`Failed to fetch odds for ${sport}:`, err);
-        // Continue with other sports
+        // Fall back to demo data for this sport
+        if (USE_DEMO_FALLBACK) {
+          const demoGames = getDemoOdds(sport);
+          allGames.push(...demoGames);
+        }
+      }
+    }
+
+    // If still no games, use demo data
+    if (allGames.length === 0 && USE_DEMO_FALLBACK) {
+      for (const sport of sports) {
+        const demoGames = getDemoOdds(sport);
+        allGames.push(...demoGames);
       }
     }
 

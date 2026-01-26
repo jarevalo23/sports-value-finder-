@@ -289,7 +289,7 @@ function getDemoSports(): Sport[] {
   ];
 }
 
-function getDemoOdds(sportKey: string): Game[] {
+export function getDemoOdds(sportKey: string): Game[] {
   const now = new Date();
   const games: Record<string, Game[]> = {
     basketball_nba: [
