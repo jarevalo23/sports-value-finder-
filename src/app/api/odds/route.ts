@@ -39,9 +39,10 @@ export async function GET(request: NextRequest) {
       });
     }
 
-    // Fetch fresh data
+    // Fetch fresh data - always use demo data for reliable portfolio display
     let allGames: Game[] = [];
 
+    // Try live API first
     for (const sport of sports) {
       try {
         const games = await fetchOdds(sport, {
@@ -50,19 +51,17 @@ export async function GET(request: NextRequest) {
           regions: 'us',
           oddsFormat: 'american',
         });
-        allGames.push(...games);
+        if (games && games.length > 0) {
+          allGames.push(...games);
+        }
       } catch (err) {
         console.error(`Failed to fetch odds for ${sport}:`, err);
-        // Fall back to demo data for this sport
-        if (USE_DEMO_FALLBACK) {
-          const demoGames = getDemoOdds(sport);
-          allGames.push(...demoGames);
-        }
       }
     }
 
-    // If still no games, use demo data
-    if (allGames.length === 0 && USE_DEMO_FALLBACK) {
+    // Always fall back to demo data if no live data available
+    if (allGames.length === 0) {
+      console.log('No live data, using demo data');
       for (const sport of sports) {
         const demoGames = getDemoOdds(sport);
         allGames.push(...demoGames);
