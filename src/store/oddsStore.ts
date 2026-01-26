@@ -33,6 +33,7 @@ interface OddsState {
 
   // Actions
   setGames: (games: Game[]) => void;
+  setValueBets: (valueBets: ValueBet[]) => void;
   setLoading: (loading: boolean) => void;
   setError: (error: string | null) => void;
   recalculateValueBets: () => void;
@@ -82,6 +83,11 @@ export const useOddsStore = create<OddsState>()(
       setGames: (games) => {
         set({ games, lastUpdated: new Date().toISOString() });
         get().recalculateValueBets();
+      },
+
+      // Direct setter for value bets from Python backend
+      setValueBets: (valueBets) => {
+        set({ valueBets, lastUpdated: new Date().toISOString() });
       },
 
       setLoading: (isLoading) => set({ isLoading }),
