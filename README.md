@@ -24,16 +24,6 @@ A premium sports betting value finder application with a sophisticated Financial
 - Point Spreads
 - Totals (Over/Under)
 
-## Design
-
-Built with a **Financial Terminal** aesthetic featuring:
-- Dark theme with cyan/emerald accents
-- JetBrains Mono + Space Grotesk typography
-- Glassmorphism cards with subtle gradients
-- Real-time data animations
-- Pulse effects for live indicators
-- Grid pattern background with scan line effect
-
 ## Tech Stack
 
 - **Framework**: Next.js 15 with App Router
