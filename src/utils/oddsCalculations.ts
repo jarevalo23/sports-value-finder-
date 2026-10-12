@@ -118,6 +118,41 @@ export function calculateConsensusImpliedProbability(oddsList: number[]): number
 }
 
 /**
+ * Remove the bookmaker margin from a set of mutually exclusive outcome
+ * probabilities (multiplicative / proportional method) so they sum to 1.
+ * Raw implied probabilities from a 2-way market typically sum to ~1.04-1.05.
+ */
+export function devigMultiplicative(probabilities: number[]): number[] {
+  const total = probabilities.reduce((acc, p) => acc + p, 0);
+  if (total <= 0) return probabilities.map(() => 0);
+  return probabilities.map((p) => p / total);
+}
+
+/**
+ * Overround (book margin) of a market: sum of implied probabilities minus 1.
+ */
+export function overround(probabilities: number[]): number {
+  return probabilities.reduce((acc, p) => acc + p, 0) - 1;
+}
+
+/**
+ * Expected value per $1 staked at the given decimal odds when the true win
+ * probability is `trueProbability`. 0.05 means +5% return on stake.
+ */
+export function evPerDollar(trueProbability: number, decimalOdds: number): number {
+  return trueProbability * decimalOdds - 1;
+}
+
+/**
+ * Expected value per $1 for a binary $1-payout contract bought at `cost`
+ * (price plus fees, in dollars) when it pays out with probability `p`.
+ */
+export function contractEvPerDollar(p: number, cost: number): number {
+  if (cost <= 0) return 0;
+  return p / cost - 1;
+}
+
+/**
  * Format American odds for display
  */
 export function formatAmericanOdds(odds: number): string {

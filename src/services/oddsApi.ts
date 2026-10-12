@@ -10,6 +10,8 @@ import {
   BASELINE_BOOKMAKERS,
   BOOKMAKER_DISPLAY_NAMES,
 } from '@/types/odds';
+import { z } from 'zod';
+import { fetchJson } from '@/lib/http';
 import {
   impliedProbability,
   calculateAverageOdds,
@@ -20,6 +22,32 @@ import {
 } from '@/utils/oddsCalculations';
 
 const API_BASE_URL = 'https://api.the-odds-api.com/v4';
+
+// Validates The Odds API payload so schema drift fails loudly, not silently.
+const GamesSchema: z.ZodType<Game[]> = z.array(
+  z.object({
+    id: z.string(),
+    sport_key: z.string(),
+    sport_title: z.string(),
+    commence_time: z.string(),
+    home_team: z.string(),
+    away_team: z.string(),
+    bookmakers: z.array(
+      z.object({
+        key: z.string(),
+        title: z.string(),
+        last_update: z.string(),
+        markets: z.array(
+          z.object({
+            key: z.string(),
+            last_update: z.string(),
+            outcomes: z.array(z.object({ name: z.string(), price: z.number(), point: z.number().optional() })),
+          })
+        ),
+      })
+    ),
+  })
+);
 
 interface OddsApiConfig {
   apiKey: string;
@@ -66,17 +94,10 @@ export async function fetchOdds(
   const regions = config.regions || 'us';
   const oddsFormat = config.oddsFormat || 'american';
 
-  const url = `${API_BASE_URL}/sports/${sportKey}/odds?apiKey=${config.apiKey}&regions=${regions}&markets=${markets}&oddsFormat=${oddsFormat}`;
+  const url = `${API_BASE_URL}/sports/${encodeURIComponent(sportKey)}/odds?apiKey=${config.apiKey}&regions=${regions}&markets=${markets}&oddsFormat=${oddsFormat}`;
 
-  const response = await fetch(url, {
-    next: { revalidate: 60 }, // Cache for 1 minute
-  });
-
-  if (!response.ok) {
-    throw new Error(`Failed to fetch odds: ${response.statusText}`);
-  }
-
-  return response.json();
+  // fetchJson adds timeout, retry/backoff, schema validation and key redaction.
+  return fetchJson(url, { source: 'the-odds-api', schema: GamesSchema });
 }
 
 /**

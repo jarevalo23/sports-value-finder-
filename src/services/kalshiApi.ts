@@ -1,13 +1,17 @@
 // Kalshi market-data service layer.
 //
-// Pulls event-contract markets from Kalshi, normalizes them into games with
-// win/tie/lose outcomes, and exposes two rankings:
-//   1. getHighestBets()        -> where the most money is actually placed
-//   2. getMostProbableEvents() -> the likeliest outcome per game (by price)
+// Pulls event-contract markets (and individual trades) from Kalshi, validates
+// them, and normalizes them into games with win/tie/lose outcomes. Exposes:
+//   1. getHighestBets()        -> where the most money is placed (popularity,
+//                                 NOT a value signal)
+//   2. getMostProbableEvents() -> the likeliest outcome per game (devigged)
+//   3. kalshiGameToVenueEvent / fetchKalshiTrades -> inputs for the
+//                                 cross-venue reasoning layer
 //
-// Mirrors the demo-fallback pattern used by oddsApi.ts so the app keeps working
-// with no credentials configured.
+// Live and demo data go through the same schema + normalizer, so demo mode
+// exercises the real code path.
 
+import { z } from 'zod';
 import {
   KalshiRawMarket,
   KalshiGame,
@@ -17,19 +21,117 @@ import {
   KalshiProbableEvent,
   VolumeMetric,
 } from '@/types/kalshi';
-import { probabilityToAmerican } from '@/utils/oddsCalculations';
+import type { DataSource, Trade, VenueEvent } from '@/types/market';
+import { DRAW_KEY } from '@/types/market';
+import { probabilityToAmerican, devigMultiplicative, overround } from '@/utils/oddsCalculations';
+import { fetchJson, mapLimit } from '@/lib/http';
+import { canonicalTeam, isDrawLabel, splitMatchup } from '@/lib/teams';
+import { demoKalshiEventsResponse, demoKalshiTradesResponse } from '@/services/demo/crossVenueDemo';
 
-// Public Kalshi v2 trade API host.
+// Public Kalshi v2 trade API host (market data needs no auth).
 const KALSHI_BASE_URL =
   process.env.KALSHI_API_BASE_URL || 'https://api.elections.kalshi.com/trade-api/v2';
 
-// Use demo data unless a real series is configured.
-const USE_DEMO_DATA = !process.env.KALSHI_SERIES_TICKER;
-
-interface KalshiConfig {
-  seriesTicker?: string;
-  limit?: number;
+/** Comma-separated Kalshi series tickers to load; unset means demo mode. */
+function configuredSeries(): string[] {
+  return (process.env.KALSHI_SERIES_TICKER || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
 }
+
+export function kalshiSource(): DataSource {
+  return configuredSeries().length > 0 ? 'live' : 'demo';
+}
+
+/** Kalshi taker fee ≈ 0.07 × P × (1 − P) per contract. Verify against the current fee schedule. */
+export const KALSHI_FEE_COEFFICIENT = 0.07;
+
+// ------------------------------------------------------------- schemas
+// Kalshi has published prices both as integer cents (`yes_bid`) and as
+// dollar strings (`yes_bid_dollars`); accept either and normalize to cents.
+
+const optNum = z.number().nullish();
+const optStr = z.string().nullish();
+
+const KalshiMarketSchema = z
+  .object({
+    ticker: z.string(),
+    event_ticker: z.string(),
+    title: z.string().nullish(),
+    yes_sub_title: optStr,
+    no_sub_title: optStr,
+    status: optStr,
+    yes_bid: optNum,
+    yes_bid_dollars: optStr,
+    yes_ask: optNum,
+    yes_ask_dollars: optStr,
+    last_price: optNum,
+    last_price_dollars: optStr,
+    volume: optNum,
+    volume_fp: optStr,
+    volume_24h: optNum,
+    volume_24h_fp: optStr,
+    open_interest: optNum,
+    open_interest_fp: optStr,
+    liquidity: optNum,
+    close_time: optStr,
+    expected_expiration_time: optStr,
+  })
+  .transform((m): KalshiRawMarket => {
+    const cents = (n: number | null | undefined, dollars: string | null | undefined) =>
+      n ?? (dollars != null ? Math.round(Number(dollars) * 100) : 0);
+    const count = (n: number | null | undefined, fp: string | null | undefined) =>
+      n ?? (fp != null ? Number(fp) : 0);
+    return {
+      ticker: m.ticker,
+      event_ticker: m.event_ticker,
+      title: m.title ?? '',
+      yes_sub_title: m.yes_sub_title ?? undefined,
+      no_sub_title: m.no_sub_title ?? undefined,
+      status: m.status ?? 'active',
+      yes_bid: cents(m.yes_bid, m.yes_bid_dollars),
+      yes_ask: cents(m.yes_ask, m.yes_ask_dollars),
+      last_price: cents(m.last_price, m.last_price_dollars),
+      volume: count(m.volume, m.volume_fp),
+      volume_24h: count(m.volume_24h, m.volume_24h_fp),
+      open_interest: count(m.open_interest, m.open_interest_fp),
+      liquidity: m.liquidity ?? undefined,
+      close_time: m.close_time ?? undefined,
+      expected_expiration_time: m.expected_expiration_time ?? undefined,
+    };
+  });
+
+const KalshiEventSchema = z.object({
+  event_ticker: z.string(),
+  title: z.string(),
+  sub_title: optStr,
+  markets: z.array(KalshiMarketSchema).nullish(),
+});
+
+const KalshiEventsResponseSchema = z.object({
+  events: z.array(KalshiEventSchema),
+  cursor: optStr,
+});
+type KalshiEvent = z.infer<typeof KalshiEventSchema>;
+
+const KalshiTradeSchema = z.object({
+  trade_id: z.string(),
+  ticker: z.string(),
+  count: optNum,
+  count_fp: optStr,
+  yes_price: optNum,
+  yes_price_dollars: optStr,
+  taker_side: z.enum(['yes', 'no']),
+  created_time: z.string(),
+});
+
+const KalshiTradesResponseSchema = z.object({
+  trades: z.array(KalshiTradeSchema),
+  cursor: optStr,
+});
+
+// ------------------------------------------------------------- helpers
 
 /**
  * Convert a Kalshi contract price (cents, 1-99) to an implied probability (0-1).
@@ -39,83 +141,161 @@ export function priceCentsToProbability(priceCents: number): number {
 }
 
 /**
- * Pick the best available price for a market: prefer last traded price, fall
- * back to the bid/ask midpoint.
+ * Best estimate of the current price: bid/ask midpoint when the book is
+ * two-sided (it reflects now), otherwise the last trade.
  */
 function effectivePriceCents(m: KalshiRawMarket): number {
-  if (m.last_price && m.last_price > 0) return m.last_price;
-  if (m.yes_bid && m.yes_ask) return Math.round((m.yes_bid + m.yes_ask) / 2);
+  if (m.yes_bid > 0 && m.yes_ask > 0) return Math.round((m.yes_bid + m.yes_ask) / 2);
+  if (m.last_price > 0) return m.last_price;
   return m.yes_ask || m.yes_bid || 50;
 }
 
-/**
- * Fetch raw markets for a Kalshi series. Falls back to demo data when no series
- * is configured or the request fails.
- */
-export async function fetchKalshiMarkets(
-  config: KalshiConfig = {}
-): Promise<KalshiRawMarket[]> {
-  if (USE_DEMO_DATA && !config.seriesTicker) {
-    return getDemoMarkets();
-  }
-
-  const seriesTicker = config.seriesTicker || process.env.KALSHI_SERIES_TICKER;
-  const limit = config.limit ?? 200;
-  const url = `${KALSHI_BASE_URL}/markets?limit=${limit}&status=open${
-    seriesTicker ? `&series_ticker=${seriesTicker}` : ''
-  }`;
-
-  const response = await fetch(url, { next: { revalidate: 60 } });
-  if (!response.ok) {
-    throw new Error(`Failed to fetch Kalshi markets: ${response.statusText}`);
-  }
-
-  const json = await response.json();
-  return (json.markets || []) as KalshiRawMarket[];
-}
-
-/**
- * Infer which side of a game a market represents from its label. Kalshi soccer
- * markets are typically phrased per-outcome (team win / draw / opponent win).
- */
 function inferSide(label: string, homeTeam: string, awayTeam: string): KalshiOutcomeSide {
-  const l = label.toLowerCase();
-  if (/(draw|tie)/.test(l)) return 'tie';
-  if (awayTeam && l.includes(awayTeam.toLowerCase())) return 'lose'; // away win = home loses
-  if (homeTeam && l.includes(homeTeam.toLowerCase())) return 'win';
+  if (isDrawLabel(label)) return 'tie';
+  const key = canonicalTeam(label);
+  if (awayTeam && key === canonicalTeam(awayTeam)) return 'lose'; // away win = home loses
   return 'win';
 }
 
-/**
- * Normalize a single raw market into an outcome.
- */
-function normalizeOutcome(
-  m: KalshiRawMarket,
-  homeTeam: string,
-  awayTeam: string
-): KalshiOutcome {
-  const priceCents = effectivePriceCents(m);
-  const impliedProbability = priceCentsToProbability(priceCents);
-  const selection = m.yes_sub_title || m.title;
-  const openInterest = m.open_interest ?? 0;
+// --------------------------------------------------------------- fetch
 
-  return {
-    ticker: m.ticker,
-    selection,
-    side: inferSide(selection, homeTeam, awayTeam),
-    priceCents,
-    impliedProbability,
-    americanOdds: probabilityToAmerican(impliedProbability),
-    volume: m.volume ?? 0,
-    volume24h: m.volume_24h ?? 0,
-    openInterest,
-    notionalUsd: Math.round(openInterest * (priceCents / 100)),
-  };
+/**
+ * Load open events (with nested markets) for every configured series. Demo
+ * mode returns the bundled demo payload through the same schema.
+ */
+export async function fetchKalshiEvents(): Promise<KalshiEvent[]> {
+  const series = configuredSeries();
+  if (series.length === 0) {
+    return KalshiEventsResponseSchema.parse(demoKalshiEventsResponse()).events;
+  }
+
+  const pages = await mapLimit(series, 3, (s) =>
+    fetchJson(
+      `${KALSHI_BASE_URL}/events?series_ticker=${encodeURIComponent(s)}&status=open&with_nested_markets=true&limit=200`,
+      { source: 'kalshi', schema: KalshiEventsResponseSchema, init: { next: { revalidate: 30 } } as RequestInit }
+    )
+  );
+  return pages.flatMap((p) => p.events);
 }
 
 /**
- * Group raw markets into games keyed by event ticker. Metadata (teams, sport,
- * commence time) is taken from the embedded demo fields when present.
+ * Backward-compatible flat market list (used by /api/kalshi).
+ */
+export async function fetchKalshiMarkets(): Promise<KalshiRawMarket[]> {
+  const events = await fetchKalshiEvents();
+  return events.flatMap((e) => e.markets ?? []);
+}
+
+/**
+ * Recent trades for one market, normalized to the venue-neutral Trade shape.
+ */
+export async function fetchKalshiTrades(
+  ticker: string,
+  outcomeKey: string,
+  eventId: string,
+  limit: number = 500
+): Promise<Trade[]> {
+  const raw =
+    kalshiSource() === 'demo'
+      ? KalshiTradesResponseSchema.parse(demoKalshiTradesResponse(ticker))
+      : await fetchJson(
+          `${KALSHI_BASE_URL}/markets/trades?ticker=${encodeURIComponent(ticker)}&limit=${limit}`,
+          { source: 'kalshi', schema: KalshiTradesResponseSchema }
+        );
+
+  return raw.trades.map((t) => {
+    const yesCents = t.yes_price ?? Math.round(Number(t.yes_price_dollars ?? 0) * 100);
+    const contracts = t.count ?? Number(t.count_fp ?? 0);
+    const probability = priceCentsToProbability(yesCents);
+    const stance = t.taker_side === 'yes' ? 'for' : 'against';
+    // Taker buying YES pays the YES price; taker buying NO pays (1 − YES price).
+    const costPerContract = stance === 'for' ? probability : 1 - probability;
+    return {
+      venue: 'kalshi' as const,
+      tradeId: t.trade_id,
+      eventId,
+      marketId: t.ticker,
+      outcomeKey,
+      stance,
+      probability,
+      size: contracts,
+      notionalUsd: Math.round(contracts * costPerContract),
+      timestamp: new Date(t.created_time).toISOString(),
+    };
+  });
+}
+
+// ----------------------------------------------------------- normalize
+
+function eventTeams(event: KalshiEvent): { homeTeam: string; awayTeam: string } {
+  const split = splitMatchup(event.title);
+  if (split) return { homeTeam: split.home, awayTeam: split.away };
+  const teams = (event.markets ?? [])
+    .map((m) => m.yes_sub_title || '')
+    .filter((l) => l && !isDrawLabel(l));
+  return { homeTeam: teams[0] ?? event.title, awayTeam: teams[1] ?? '' };
+}
+
+/**
+ * Kalshi doesn't publish kickoff on the market; expected expiration is roughly
+ * the end of the match, so back off ~2h. Cross-venue matching prefers the
+ * sportsbook/Polymarket kickoff when one is available.
+ */
+function approxKickoff(markets: KalshiRawMarket[]): string {
+  const times = markets
+    .map((m) => Date.parse(m.expected_expiration_time ?? m.close_time ?? ''))
+    .filter((t) => !Number.isNaN(t));
+  if (times.length === 0) return new Date().toISOString();
+  return new Date(Math.min(...times) - 2 * 3600_000).toISOString();
+}
+
+export function normalizeKalshiEvents(events: KalshiEvent[]): KalshiGame[] {
+  return events
+    .filter((e) => (e.markets ?? []).length > 0)
+    .map((event) => {
+      const markets = event.markets ?? [];
+      const { homeTeam, awayTeam } = eventTeams(event);
+      const raw = markets.map((m) => priceCentsToProbability(effectivePriceCents(m)));
+      const fair = devigMultiplicative(raw);
+
+      const outcomes: KalshiOutcome[] = markets.map((m, i) => {
+        const priceCents = effectivePriceCents(m);
+        const selection = m.yes_sub_title || m.title;
+        const openInterest = m.open_interest ?? 0;
+        return {
+          ticker: m.ticker,
+          selection,
+          side: inferSide(selection, homeTeam, awayTeam),
+          priceCents,
+          bidCents: m.yes_bid || undefined,
+          askCents: m.yes_ask || undefined,
+          impliedProbability: raw[i],
+          fairProbability: fair[i],
+          americanOdds: probabilityToAmerican(fair[i]),
+          volume: m.volume ?? 0,
+          volume24h: m.volume_24h ?? 0,
+          openInterest,
+          notionalUsd: Math.round(openInterest * (priceCents / 100)),
+        };
+      });
+
+      return {
+        eventTicker: event.event_ticker,
+        sportKey: 'soccer',
+        sportTitle: 'Soccer',
+        title: event.title,
+        homeTeam,
+        awayTeam,
+        commenceTime: approxKickoff(markets),
+        outcomes,
+        totalVolume: outcomes.reduce((s, o) => s + o.volume, 0),
+        totalOpenInterest: outcomes.reduce((s, o) => s + o.openInterest, 0),
+      };
+    });
+}
+
+/**
+ * Backward-compatible: group a flat market list into games (titles inferred).
  */
 export function normalizeKalshiGames(markets: KalshiRawMarket[]): KalshiGame[] {
   const byEvent = new Map<string, KalshiRawMarket[]>();
@@ -123,32 +303,46 @@ export function normalizeKalshiGames(markets: KalshiRawMarket[]): KalshiGame[] {
     if (!byEvent.has(m.event_ticker)) byEvent.set(m.event_ticker, []);
     byEvent.get(m.event_ticker)!.push(m);
   }
-
-  const games: KalshiGame[] = [];
-  for (const [eventTicker, group] of byEvent) {
-    const meta = DEMO_EVENT_META[eventTicker] || parseTitle(group[0]?.title || eventTicker);
-    const outcomes = group.map((m) => normalizeOutcome(m, meta.homeTeam, meta.awayTeam));
-
-    games.push({
-      eventTicker,
-      sportKey: meta.sportKey,
-      sportTitle: meta.sportTitle,
-      title: meta.title,
-      homeTeam: meta.homeTeam,
-      awayTeam: meta.awayTeam,
-      commenceTime: meta.commenceTime,
-      outcomes,
-      totalVolume: outcomes.reduce((s, o) => s + o.volume, 0),
-      totalOpenInterest: outcomes.reduce((s, o) => s + o.openInterest, 0),
-    });
-  }
-
-  return games;
+  const events: KalshiEvent[] = [...byEvent].map(([event_ticker, ms]) => ({
+    event_ticker,
+    title: (ms[0]?.title || event_ticker).replace(/\s*winner\??$/i, ''),
+    markets: ms,
+  }));
+  return normalizeKalshiEvents(events);
 }
+
+export function getDemoMarkets(): KalshiRawMarket[] {
+  return KalshiEventsResponseSchema.parse(demoKalshiEventsResponse()).events.flatMap((e) => e.markets ?? []);
+}
+
+export function kalshiGameToVenueEvent(game: KalshiGame): VenueEvent {
+  return {
+    venue: 'kalshi',
+    source: kalshiSource(),
+    eventId: game.eventTicker,
+    title: game.title,
+    homeTeam: game.homeTeam,
+    awayTeam: game.awayTeam,
+    commenceTime: game.commenceTime,
+    overround: overround(game.outcomes.map((o) => o.impliedProbability)),
+    outcomes: game.outcomes.map((o) => ({
+      key: o.side === 'tie' ? DRAW_KEY : canonicalTeam(o.selection),
+      label: o.selection,
+      marketId: o.ticker,
+      rawProbability: o.impliedProbability,
+      fairProbability: o.fairProbability,
+      bid: o.bidCents != null ? o.bidCents / 100 : undefined,
+      ask: o.askCents != null ? o.askCents / 100 : undefined,
+      volume: o.volume,
+    })),
+  };
+}
+
+// ------------------------------------------------------------- rankings
 
 /**
  * Rank every outcome across all games by how heavily it is backed.
- * This answers: "what is the highest bet for win / tie / lose right now?"
+ * This is a flow/popularity signal — heavy volume is not evidence of value.
  */
 export function getHighestBets(
   games: KalshiGame[],
@@ -173,220 +367,31 @@ export function getHighestBets(
       });
     }
   }
-
   return rows.sort((a, b) => b[metric] - a[metric]).slice(0, limit);
 }
 
 /**
- * For each game, return its single most probable outcome, ranked across games.
- * This answers: "what is the most probable event happening?"
+ * For each game, return its single most probable outcome (devigged),
+ * ranked across games.
  */
 export function getMostProbableEvents(games: KalshiGame[]): KalshiProbableEvent[] {
   const rows: KalshiProbableEvent[] = [];
   for (const game of games) {
     if (game.outcomes.length === 0) continue;
     const favored = game.outcomes.reduce((best, o) =>
-      o.impliedProbability > best.impliedProbability ? o : best
+      o.fairProbability > best.fairProbability ? o : best
     );
     rows.push({
       eventTicker: game.eventTicker,
       title: game.title,
       favoredSelection: favored.selection,
       side: favored.side,
-      impliedProbability: favored.impliedProbability,
+      impliedProbability: favored.fairProbability,
       priceCents: favored.priceCents,
       americanOdds: favored.americanOdds,
       volume: favored.volume,
       openInterest: favored.openInterest,
     });
   }
-
   return rows.sort((a, b) => b.impliedProbability - a.impliedProbability);
-}
-
-// ============== METADATA / DEMO DATA ==============
-
-interface EventMeta {
-  sportKey: string;
-  sportTitle: string;
-  title: string;
-  homeTeam: string;
-  awayTeam: string;
-  commenceTime: string;
-}
-
-/**
- * Best-effort parse of a market title like "Brazil vs Haiti" into teams.
- */
-function parseTitle(title: string): EventMeta {
-  const match = title.match(/(.+?)\s+(?:vs\.?|@|v)\s+(.+)/i);
-  const homeTeam = match ? match[1].trim() : title;
-  const awayTeam = match ? match[2].trim() : '';
-  return {
-    sportKey: 'soccer',
-    sportTitle: 'Soccer',
-    title,
-    homeTeam,
-    awayTeam,
-    commenceTime: new Date().toISOString(),
-  };
-}
-
-const soon = (hours: number) => new Date(Date.now() + hours * 3600000).toISOString();
-
-const DEMO_EVENT_META: Record<string, EventMeta> = {
-  'WORLDCUP-BRAHAI': {
-    sportKey: 'soccer',
-    sportTitle: 'Soccer (World Cup)',
-    title: 'Brazil vs Haiti',
-    homeTeam: 'Brazil',
-    awayTeam: 'Haiti',
-    commenceTime: soon(6),
-  },
-  'WORLDCUP-ARGMEX': {
-    sportKey: 'soccer',
-    sportTitle: 'Soccer (World Cup)',
-    title: 'Argentina vs Mexico',
-    homeTeam: 'Argentina',
-    awayTeam: 'Mexico',
-    commenceTime: soon(9),
-  },
-  'EPL-MCILIV': {
-    sportKey: 'soccer_epl',
-    sportTitle: 'Premier League',
-    title: 'Man City vs Liverpool',
-    homeTeam: 'Man City',
-    awayTeam: 'Liverpool',
-    commenceTime: soon(28),
-  },
-};
-
-/**
- * Demo markets approximating Kalshi soccer (3-way win/tie/lose) contracts.
- * Prices are in cents (= implied probability); volume/open_interest are
- * contract counts. Numbers are illustrative.
- */
-export function getDemoMarkets(): KalshiRawMarket[] {
-  return [
-    // Brazil vs Haiti — lopsided favorite, very heavy backing on Brazil.
-    {
-      ticker: 'WORLDCUP-BRAHAI-BRA',
-      event_ticker: 'WORLDCUP-BRAHAI',
-      title: 'Brazil vs Haiti',
-      yes_sub_title: 'Brazil',
-      status: 'active',
-      yes_bid: 87,
-      yes_ask: 89,
-      last_price: 88,
-      volume: 412350,
-      volume_24h: 95120,
-      open_interest: 188400,
-    },
-    {
-      ticker: 'WORLDCUP-BRAHAI-DRAW',
-      event_ticker: 'WORLDCUP-BRAHAI',
-      title: 'Brazil vs Haiti',
-      yes_sub_title: 'Draw',
-      status: 'active',
-      yes_bid: 8,
-      yes_ask: 10,
-      last_price: 9,
-      volume: 54210,
-      volume_24h: 9800,
-      open_interest: 31200,
-    },
-    {
-      ticker: 'WORLDCUP-BRAHAI-HAI',
-      event_ticker: 'WORLDCUP-BRAHAI',
-      title: 'Brazil vs Haiti',
-      yes_sub_title: 'Haiti',
-      status: 'active',
-      yes_bid: 3,
-      yes_ask: 5,
-      last_price: 4,
-      volume: 38900,
-      volume_24h: 6400,
-      open_interest: 22750,
-    },
-    // Argentina vs Mexico — closer favorite.
-    {
-      ticker: 'WORLDCUP-ARGMEX-ARG',
-      event_ticker: 'WORLDCUP-ARGMEX',
-      title: 'Argentina vs Mexico',
-      yes_sub_title: 'Argentina',
-      status: 'active',
-      yes_bid: 61,
-      yes_ask: 63,
-      last_price: 62,
-      volume: 221400,
-      volume_24h: 71250,
-      open_interest: 142800,
-    },
-    {
-      ticker: 'WORLDCUP-ARGMEX-DRAW',
-      event_ticker: 'WORLDCUP-ARGMEX',
-      title: 'Argentina vs Mexico',
-      yes_sub_title: 'Draw',
-      status: 'active',
-      yes_bid: 22,
-      yes_ask: 24,
-      last_price: 23,
-      volume: 88600,
-      volume_24h: 20100,
-      open_interest: 64300,
-    },
-    {
-      ticker: 'WORLDCUP-ARGMEX-MEX',
-      event_ticker: 'WORLDCUP-ARGMEX',
-      title: 'Argentina vs Mexico',
-      yes_sub_title: 'Mexico',
-      status: 'active',
-      yes_bid: 14,
-      yes_ask: 16,
-      last_price: 15,
-      volume: 73400,
-      volume_24h: 16850,
-      open_interest: 51900,
-    },
-    // Man City vs Liverpool — tight, big total volume.
-    {
-      ticker: 'EPL-MCILIV-MCI',
-      event_ticker: 'EPL-MCILIV',
-      title: 'Man City vs Liverpool',
-      yes_sub_title: 'Man City',
-      status: 'active',
-      yes_bid: 45,
-      yes_ask: 47,
-      last_price: 46,
-      volume: 305700,
-      volume_24h: 50300,
-      open_interest: 175600,
-    },
-    {
-      ticker: 'EPL-MCILIV-DRAW',
-      event_ticker: 'EPL-MCILIV',
-      title: 'Man City vs Liverpool',
-      yes_sub_title: 'Draw',
-      status: 'active',
-      yes_bid: 26,
-      yes_ask: 28,
-      last_price: 27,
-      volume: 142900,
-      volume_24h: 24700,
-      open_interest: 98200,
-    },
-    {
-      ticker: 'EPL-MCILIV-LIV',
-      event_ticker: 'EPL-MCILIV',
-      title: 'Man City vs Liverpool',
-      yes_sub_title: 'Liverpool',
-      status: 'active',
-      yes_bid: 27,
-      yes_ask: 29,
-      last_price: 28,
-      volume: 151200,
-      volume_24h: 26900,
-      open_interest: 101400,
-    },
-  ];
 }

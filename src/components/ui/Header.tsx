@@ -1,6 +1,7 @@
 'use client';
 
 import { useState } from 'react';
+import Link from 'next/link';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Settings, X, Zap } from 'lucide-react';
 import { useOddsStore } from '@/store/oddsStore';
@@ -12,10 +13,10 @@ export function Header() {
   return (
     <>
       <header className="sticky top-0 z-50 border-b border-[var(--border-subtle)] bg-[var(--bg-primary)]/80 backdrop-blur-xl">
-        <div className="max-w-7xl mx-auto px-6 py-4">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 py-4">
           <div className="flex items-center justify-between">
             {/* Logo */}
-            <div className="flex items-center gap-3">
+            <div className="flex items-center gap-2 sm:gap-3">
               <div className="relative">
                 <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-cyan-500 to-emerald-500 flex items-center justify-center">
                   <Zap className="w-5 h-5 text-[var(--bg-primary)]" />
@@ -23,15 +24,23 @@ export function Header() {
                 <div className="absolute -inset-1 rounded-xl bg-gradient-to-br from-cyan-500 to-emerald-500 opacity-30 blur-lg" />
               </div>
               <div>
-                <h1 className="text-xl font-bold text-[var(--text-primary)]">
+                <h1 className="text-lg sm:text-xl font-bold text-[var(--text-primary)]">
                   ValueEdge
                 </h1>
-                <p className="text-xs text-[var(--text-muted)]">Sports Betting Intelligence</p>
+                <p className="hidden sm:block text-xs text-[var(--text-muted)]">Sports Betting Intelligence</p>
               </div>
             </div>
 
             {/* Right side */}
-            <div className="flex items-center gap-4">
+            <div className="flex items-center gap-2 sm:gap-4">
+              <nav className="flex items-center gap-1 whitespace-nowrap text-sm">
+                <Link href="/" className="rounded-lg px-2 sm:px-3 py-1.5 text-[var(--text-secondary)] hover:bg-[var(--bg-secondary)] hover:text-[var(--text-primary)]">
+                  Value bets
+                </Link>
+                <Link href="/plays" className="rounded-lg px-2 sm:px-3 py-1.5 text-[var(--text-secondary)] hover:bg-[var(--bg-secondary)] hover:text-[var(--text-primary)]">
+                  Big plays
+                </Link>
+              </nav>
               <div className="hidden md:flex items-center gap-2 px-3 py-1.5 rounded-lg bg-[var(--bg-secondary)] border border-[var(--border-subtle)]">
                 <span className="text-xs text-[var(--text-muted)]">Demo Mode</span>
                 <div className="w-2 h-2 rounded-full bg-amber-500" />
@@ -39,7 +48,8 @@ export function Header() {
 
               <button
                 onClick={() => setShowSettings(true)}
-                className="p-2.5 rounded-lg bg-[var(--bg-secondary)] border border-[var(--border-subtle)]
+                aria-label="Settings"
+                className="p-2 sm:p-2.5 rounded-lg bg-[var(--bg-secondary)] border border-[var(--border-subtle)]
                   text-[var(--text-secondary)] hover:text-[var(--text-primary)]
                   hover:border-[var(--border-accent)] transition-all duration-200"
               >

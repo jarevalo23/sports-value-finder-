@@ -27,6 +27,7 @@ export interface KalshiRawMarket {
   open_interest: number; // contracts currently outstanding
   liquidity?: number;
   close_time?: string;
+  expected_expiration_time?: string;
 }
 
 /**
@@ -38,7 +39,10 @@ export interface KalshiOutcome {
   selection: string; // human label, e.g. "Brazil" or "Draw"
   side: KalshiOutcomeSide; // win / tie / lose relative to the home/listed team
   priceCents: number; // 1-99, contract mid/last price
+  bidCents?: number; // best YES bid (what you get selling YES)
+  askCents?: number; // best YES ask (what you pay buying YES — the executable price)
   impliedProbability: number; // 0-1, derived from priceCents
+  fairProbability: number; // impliedProbability with the event's overround removed
   americanOdds: number; // converted for parity with the sportsbook side
   volume: number; // lifetime contracts traded
   volume24h: number; // contracts traded in last 24h

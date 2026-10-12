@@ -1,90 +1,89 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { z } from 'zod';
 import { fetchOdds, fetchSports, getDemoOdds } from '@/services/oddsApi';
 import { Game } from '@/types/odds';
+import { TtlCache, cacheKey } from '@/lib/cache';
 
-// Force dynamic rendering - no caching
 export const dynamic = 'force-dynamic';
-export const revalidate = 0;
 
 const API_KEY = process.env.ODDS_API_KEY || 'demo';
-const USE_DEMO_FALLBACK = true; // Always fall back to demo data if API fails
+const CACHE_DURATION = 60_000; // 1 minute — protects the monthly request quota
 
-// In-memory cache for rate limiting
-const cache: {
+const MARKETS = ['h2h', 'spreads', 'totals'] as const;
+const QuerySchema = z.object({
+  sports: z
+    .string()
+    .default('basketball_nba')
+    .transform((s) => s.split(',').map((x) => x.trim()).filter(Boolean))
+    .pipe(z.array(z.string().regex(/^[a-z0-9_]+$/)).min(1).max(10)),
+  markets: z
+    .string()
+    .default(MARKETS.join(','))
+    .transform((s) => s.split(',').map((x) => x.trim()).filter(Boolean))
+    .pipe(z.array(z.enum(MARKETS)).min(1)),
+});
+
+interface OddsPayload {
   data: Game[];
-  timestamp: number;
-  sports: string[];
-} = {
-  data: [],
-  timestamp: 0,
-  sports: [],
-};
+  source: 'live' | 'demo';
+  warnings: string[];
+  lastUpdated: string;
+}
 
-const CACHE_DURATION = 60000; // 1 minute cache
+// Keyed on sports AND markets (the old cache ignored markets).
+const cache = new TtlCache<OddsPayload>(50);
 
 export async function GET(request: NextRequest) {
-  try {
-    const searchParams = request.nextUrl.searchParams;
-    const sports = searchParams.get('sports')?.split(',') || ['basketball_nba'];
-    const markets = searchParams.get('markets')?.split(',') || ['h2h', 'spreads', 'totals'];
-
-    // Check cache
-    const now = Date.now();
-    const sportsKey = sports.sort().join(',');
-    const cacheValid =
-      cache.timestamp > now - CACHE_DURATION &&
-      cache.sports.sort().join(',') === sportsKey;
-
-    if (cacheValid && cache.data.length > 0) {
-      return NextResponse.json({
-        data: cache.data,
-        cached: true,
-        lastUpdated: new Date(cache.timestamp).toISOString(),
-      });
-    }
-
-    // Try live API first, fall back to demo data
-    let allGames: Game[] = [];
-
-    for (const sport of sports) {
-      try {
-        const games = await fetchOdds(sport, {
-          apiKey: API_KEY,
-          markets: markets as ('h2h' | 'spreads' | 'totals')[],
-          regions: 'us',
-          oddsFormat: 'american',
-        });
-        if (games && games.length > 0) {
-          allGames.push(...games);
-        }
-      } catch {
-        // API failed - will use demo fallback
-      }
-    }
-
-    // Fallback to demo data if live API returned nothing
-    if (allGames.length === 0) {
-      for (const sport of sports) {
-        allGames.push(...getDemoOdds(sport));
-      }
-    }
-
-    // Update cache
-    cache.data = allGames;
-    cache.timestamp = now;
-    cache.sports = sports;
-
-    return NextResponse.json({
-      data: allGames,
-      cached: false,
-      lastUpdated: new Date().toISOString(),
-    });
-  } catch (error) {
-    console.error('API Error:', error);
+  const parsed = QuerySchema.safeParse(Object.fromEntries(request.nextUrl.searchParams));
+  if (!parsed.success) {
     return NextResponse.json(
-      { error: 'Failed to fetch odds data' },
-      { status: 500 }
+      {
+        error: {
+          code: 'invalid_request',
+          message: 'Invalid query parameters',
+          issues: parsed.error.issues.map((i) => ({ param: i.path.join('.'), message: i.message })),
+        },
+      },
+      { status: 400 }
     );
+  }
+  const { sports, markets } = parsed.data;
+
+  try {
+    const payload = await cache.getOrLoad(cacheKey('odds', { sports, markets }), CACHE_DURATION, async () => {
+      const warnings: string[] = [];
+      const live: Game[] = [];
+
+      if (API_KEY !== 'demo') {
+        const results = await Promise.allSettled(
+          sports.map((sport) =>
+            fetchOdds(sport, { apiKey: API_KEY, markets: [...markets], regions: 'us', oddsFormat: 'american' })
+          )
+        );
+        results.forEach((r, i) => {
+          if (r.status === 'fulfilled') live.push(...r.value);
+          else warnings.push(`${sports[i]}: ${r.reason instanceof Error ? r.reason.message : String(r.reason)}`);
+        });
+      }
+
+      if (live.length > 0) {
+        return { data: live, source: 'live' as const, warnings, lastUpdated: new Date().toISOString() };
+      }
+
+      // Demo fallback is explicit: the response says it's demo data and why.
+      if (API_KEY !== 'demo') warnings.push('Live odds unavailable; serving demo data');
+      return {
+        data: sports.flatMap((s) => getDemoOdds(s)),
+        source: 'demo' as const,
+        warnings,
+        lastUpdated: new Date().toISOString(),
+      };
+    });
+
+    return NextResponse.json(payload);
+  } catch (error) {
+    console.error('[api/odds] failed:', error);
+    return NextResponse.json({ error: { code: 'internal_error', message: 'Failed to fetch odds data' } }, { status: 500 });
   }
 }
 
@@ -95,9 +94,6 @@ export async function OPTIONS() {
     return NextResponse.json({ data: sports });
   } catch (error) {
     console.error('API Error:', error);
-    return NextResponse.json(
-      { error: 'Failed to fetch sports' },
-      { status: 500 }
-    );
+    return NextResponse.json({ error: 'Failed to fetch sports' }, { status: 500 });
   }
 }

@@ -155,6 +155,49 @@ edge = baselineImpliedProb - bookmakerImpliedProb
 EV = (trueProbability * profit) - ((1 - trueProbability) * stake)
 ```
 
+## Big Plays & Cross-Venue Reasoning
+
+The **Big plays** page (`/plays`, API: `GET /api/plays`) finds large trades on Kalshi and Polymarket, compares each one against the other exchange and a devigged sportsbook consensus, and explains why it was most likely made.
+
+### How it works
+
+1. **Load venues**: Kalshi events, Polymarket (Gamma) events, and 3-way sportsbook odds, each normalized to one venue-neutral model (`src/types/market.ts`) with devigged fair probabilities.
+2. **Match events across venues** (`src/services/eventMatcher.ts`): canonical team names and aliases ("Man City" = "Manchester City FC"), either home/away order, kickoff window. Events that can't be matched confidently are reported, never guessed.
+3. **Detect big plays**: individual trades above `minNotional`.
+4. **Signals** (`src/reasoning/signals.ts`): 17 deterministic measurements, e.g. EV at the time of the fill (no look-ahead), EV vs current consensus, price vs the other exchange, locked-in arbitrage margin, price moves before/after on both venues, same-direction clusters, opposite flow, timing vs kickoff, size vs typical flow.
+5. **Hypotheses** (`src/reasoning/hypotheses.ts`): transparent rules score six explanations: value, arbitrage, hedge, informed flow, momentum chase, favourite backing.
+6. **Explanation** (`src/reasoning/explainer.ts`): Claude writes the narrative with structured output. It can only pick from the six explanations and cite signals that exist, and it gets every number pre-computed. Results are checked against the rule scores, cached per evidence fingerprint, and fall back to a rules-based explanation on any failure (no key, refusal, timeout, rate limit).
+
+`GET /api/plays?minNotional=10000&limit=10&explain=3&lookbackHours=24`. `explain` = how many top plays get an LLM explanation (0-5); the rest use rules. Requests with `explain>0` are rate-limited to 10/min per client.
+
+### Configuration
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `ANTHROPIC_API_KEY` | Enables Claude explanations (rules-only without it) | unset |
+| `REASONING_MODEL` / `REASONING_EFFORT` | Model and effort for explanations | `claude-opus-5-5` / `medium` |
+| `REASONING_LLM=off` | Force rules-only explanations | |
+| `KALSHI_SERIES_TICKER` | Comma-separated Kalshi series to load live (demo when unset) | unset |
+| `POLYMARKET_LIVE=true` | Load Polymarket live (demo otherwise) | unset |
+| `POLYMARKET_TAG_SLUG` | Gamma tag to scan | `soccer` |
+| `POLYMARKET_FEE_COEFFICIENT` | Taker fee × P(1−P); verify per market | `0` |
+| `SOCCER_SPORT_KEYS` | Odds API soccer keys for the sportsbook consensus | `soccer_fifa_world_cup,soccer_epl` |
+| `SPORTSBOOK_WEIGHTS` | Per-book consensus weights, e.g. `pinnacle:3,draftkings:1` | sharp books weighted up |
+
+Demo data for all three venues is shaped exactly like the real API payloads and runs through the same validation and normalization. A venue that fails in live mode is dropped and reported in `meta.warnings`; it is never silently replaced with demo data.
+
+### API practices
+
+All upstream calls go through `src/lib/http.ts`: hard timeouts, retries with jittered exponential backoff that honour `Retry-After`, zod validation of every response (schema drift fails loudly), and API keys redacted from errors. Route query params are validated with zod and errors use one shape: `{ error: { code, message } }`. Caches are keyed on every parameter, with single-flight de-duplication.
+
+### Tests
+
+```bash
+npm test
+```
+
+Covers the HTTP client, devig math, cross-venue matching, the full pipeline on demo data (each scripted play gets the expected explanation), and the Claude path against a mocked SDK (no tokens spent).
+
 ## API Rate Limiting
 
 The Odds API free tier allows 500 requests/month. This app implements:
